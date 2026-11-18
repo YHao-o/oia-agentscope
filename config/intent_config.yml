@@ -1,0 +1,60 @@
+# 意图配置文件
+# 定义意图分类、意图→智能体绑定关系、默认编排策略。
+# 意图识别引擎（LLM）的输出会被约束在这些 intent id 范围内。
+
+# ==================== 显式意图定义 ====================
+# 用户主动表达的需求类型，每个意图绑定一个负责处理的智能体
+intents:
+  - id: render_chart
+    name: 数据可视化
+    description: 用户需要图表、表格、指标卡片、可视化展示
+    agent: chart_agent
+
+  - id: general_chat
+    name: 通用问答
+    description: 常识性问题、闲聊、不需要外部工具的对话，作为兜底意图
+    agent: general_agent
+
+  - id: regulations_qa
+    name: 制度问答
+    description: 查询金科、信科、产品中心、风控及采购部门的内部制度知识。仅限公司内部规章，不含通用法律法规或外部政策
+    agent: regulations_agent
+
+# ==================== 显式触发智能体 ====================
+# 仅当用户在前端主动选择该智能体时才启用；意图识别（自动路由）
+# 的候选集中始终排除对应意图，防止重任务智能体被静默自动选中。
+# 值 = mng /api/intents 返回中 agent.code 字段（与意图条目的 agent 字段匹配）
+explicit_only_agents: []
+#  - agent_deep_research   # 示例：深度研究智能体
+
+# ==================== 工具智能体绑定 ====================
+# 声明仅允许指定智能体使用的工具（工具名 → 智能体 id 列表）。
+# 未列出的工具保持全局可见（所有智能体可用）；列出的工具只注入
+# 给列表内的智能体，其他智能体的 Toolkit 中不包含该工具。
+# 与 explicit_only_agents 配合可实现：屏蔽自动路由 + 工具专属绑定，
+# 用户必须显式选择对应智能体才能使用该工具。
+agent_bound_tools:
+  policy_qa:
+    - regulations_agent
+
+# ==================== 默认编排策略映射 ====================
+# LLM 意图识别结果中的 relation 字段决定走哪个编排器
+# relation 取值：
+#   - independent:      多意图无关联，可并行执行
+#   - related_fixed:    多意图有关联，顺序固定，走写死流水线
+#   - related_dynamic:  多意图有关联，顺序需动态决策，走 ReAct
+# 单意图统一走 parallel（直接执行，无汇总开销）
+default_orchestration:
+  single_intent: pipeline
+  multi_independent: parallel
+  multi_related_fixed: pipeline
+  multi_related_dynamic: react
+
+# ==================== 编排器参数 ====================
+orchestrator:
+  # ReAct 循环最大步数，防止死循环
+  react_max_steps: 8
+  # 并行执行单个智能体的超时时间（秒）
+  parallel_timeout: 900
+  # 流水线任一步骤超时时间（秒）
+  pipeline_step_timeout: 900

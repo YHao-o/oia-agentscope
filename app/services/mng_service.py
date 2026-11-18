@@ -1,0 +1,377 @@
+"""mng 管理中心 API 调用服务。
+
+提供从 mng 系统获取外部意图配置的能力，配合用户权限进行过滤。
+"""
+import logging
+import os
+from typing import List, Optional
+
+import httpx
+
+from app.config import MNG_INTENT_URL
+
+logger = logging.getLogger(__name__)
+
+# mng 系统意图接口
+_MNG_INTENTS_PATH = "/api/intents"
+
+# AUTH_MOCK=true 时的内置外部意图（结构与 mng /api/intents 返回一致），
+# 用于本地无 mng 服务时联调：agent id=999/1000 与 user_dao._MOCK_USERS 白名单的
+# "生成PPT智能体"/"联网搜索智能体"项（均含 mcpClientConfig）匹配，
+# 可验证 MCP 配置全链路（1000 为百度千帆 AI Search 真实 MCP 服务）。
+_MOCK_EXTERNAL_INTENTS = [
+    {
+        "id": 9001,
+        "name": "生成PPT",
+        "intentCode": "generate_ppt",
+        "status": 1,
+        "definition": "根据用户需求生成PPT文档",
+        "agent": {
+            "id": "999",
+            "name": "生成PPT智能体",
+            "code": "agent_ppt",
+            "system_prompt": "你是PPT生成智能体，负责根据用户需求生成PPT。",
+        },
+        "skills": [],
+    },
+    {
+        "id": 9002,
+        "name": "联网搜索",
+        "intentCode": "web_search",
+        "status": 1,
+        "definition": "搜索实时信息，并使用大模型进行总结回复",
+        "agent": {
+            "id": "1000",
+            "name": "联网搜索智能体",
+            "code": "agent_search",
+            "system_prompt": "你是联网搜索智能体，负责搜索实时信息并总结回复。",
+        },
+        "skills": [],
+    },
+]
+
+
+async def fetch_external_intents(jwt_token: str) -> List[dict]:
+    """从 mng 系统获取外部意图配置列表。
+
+    请求 GET {MNG_INTENT_URL}/api/intents，Header 中携带本系统签发的 JWT。
+    失败不影响主流程，返回空列表。
+
+    Args:
+        jwt_token: 本系统登录签发的 JWT，作为 Authorization 转发给 mng
+
+    Returns:
+        外部意图配置列表（已过滤禁用意图），mng 返回格式：
+        [
+            {
+                "id": 123,
+                "name": "生成PPT",
+                "intentCode": "generate_ppt",
+                "status": 1,
+                "agents": [
+                    {"id": "999", "name": "生成PPT智能体",
+                     "code": "agent_ppt", "prompt": ""}
+                ],
+                "skills": [
+                    {"id": "100", "name": "PPT生成skill",
+                     "code": "skill_ppt"}
+                ]
+            }
+        ]
+        status=0 表示禁用（返回前已剔除）；字段缺失/None 视为启用。
+    """
+    if os.getenv("AUTH_MOCK", "true").lower() == "true":
+        logger.info("[mng_service] AUTH_MOCK=true，返回内置 mock 外部意图")
+        return _MOCK_EXTERNAL_INTENTS
+    if not MNG_INTENT_URL:
+        logger.warning("[mng_service] MNG_INTENT_URL 未配置，跳过获取外部意图")
+        return []
+    if not jwt_token:
+        logger.warning("[mng_service] jwt_token 为空，跳过获取外部意图")
+        return []
+
+    url = f"{MNG_INTENT_URL}{_MNG_INTENTS_PATH}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[mng_service] 获取外部意图失败 HTTP {resp.status_code}"
+                )
+                return []
+
+            body = resp.json()
+            if body.get("code") != 200:
+                logger.warning(
+                    f"[mng_service] 获取外部意图业务失败: {body.get('message')}"
+                )
+                return []
+
+            data = body.get("data", [])
+            if not isinstance(data, list):
+                logger.warning("[mng_service] 外部意图 data 格式异常（非列表）")
+                return []
+            # 过滤禁用意图：status=0 禁用；字段缺失/None 视为启用（兼容旧版 mng）
+            enabled = [
+                x for x in data
+                if not (isinstance(x, dict) and x.get("status") == 0)
+            ]
+            if len(enabled) < len(data):
+                logger.info(
+                    f"[mng_service] 已过滤 {len(data) - len(enabled)} 个禁用意图"
+                )
+            return enabled
+    except Exception:
+        logger.exception("[mng_service] 调用 mng 获取外部意图异常，降级跳过")
+        return []
+
+
+def build_agent_definition_map(external_intents: list) -> dict:
+    """从 /api/intents 原始返回构建 agent_id → definition 映射。
+
+    供登录时为 agent_access 注入 description（值 = 对应意图的 definition）。
+    同一 agent 被多个意图关联时取首个非空 definition；
+    跳过非 dict、缺 agent/definition 的意图。
+
+    Args:
+        external_intents: fetch_external_intents 返回的原始意图列表
+
+    Returns:
+        {agent_id: definition, ...}
+    """
+    mapping: dict = {}
+    for ext in (external_intents or []):
+        if not isinstance(ext, dict):
+            continue
+        agent_data = ext.get("agent")
+        if not isinstance(agent_data, dict):
+            continue
+        agent_id = agent_data.get("id")
+        definition = ext.get("definition") or ""
+        if not agent_id or not definition:
+            continue
+        if agent_id not in mapping:
+            mapping[agent_id] = definition
+    return mapping
+
+
+def _build_whitelist_codes(agent_whitelist: list) -> set:
+    """从 agent_whitelist 列表中提取所有 code，转为集合用于快速查找。
+
+    Args:
+        agent_whitelist: [{"id":"...", "name":"...", "code":"..."}, ...]
+    """
+    codes = set()
+    if not isinstance(agent_whitelist, list):
+        return codes
+    for item in agent_whitelist:
+        if isinstance(item, dict):
+            code = item.get("id")
+            if code:
+                codes.add(code)
+    return codes
+
+
+def _build_whitelist_mcp_map(agent_whitelist: list) -> dict:
+    """从 agent_whitelist 列表中提取 id → mcpClientConfig 映射。
+
+    仅收集 mcpClientConfig 非 null 的项：
+        {"<id>": mcpClientConfig, ...}
+    供 merge_external_into_memory 附加到白名单匹配的 merged agent。
+    """
+    mapping: dict = {}
+    if not isinstance(agent_whitelist, list):
+        return mapping
+    for item in agent_whitelist:
+        if not isinstance(item, dict):
+            continue
+        mcp_cfg = item.get("mcpClientConfig")
+        item_id = item.get("id")
+        if mcp_cfg and item_id:
+            mapping[item_id] = mcp_cfg
+    return mapping
+
+
+def build_blacklist_codes(skill_blacklist: list) -> set:
+    """从 skill_blacklist 列表中提取所有 code，转为集合用于快速查找。
+
+    公共函数：除融合层过滤外部技能外，orchestrator 亦用它做
+    内置技能（bocha_search 联网搜索）的 mng 权限校验。
+    """
+    codes = set()
+    if not isinstance(skill_blacklist, list):
+        return codes
+    for item in skill_blacklist:
+        if isinstance(item, dict):
+            code = item.get("code")
+            if code:
+                codes.add(code)
+    return codes
+
+
+def merge_external_into_memory(
+    base_intents: list,
+    base_agents: list,
+    base_skills: list,
+    external_intents: list,
+    permissions: dict,
+    external_skills_dir: str,
+) -> tuple:
+    """将 mng 外部意图合并到基础配置中，并进行权限过滤。
+
+    合并规则：
+    - 外部 intent 的 id 用 intentCode 代替
+    - 外部 agent 的 id 用 agent.code 代替
+    - 外部 skill 的 directory 用 {external_skills_dir}/{skill.code}
+    - 外部 agent 不在 agent_whitelist 中 → 跳过（同时取消关联）
+    - 外部 skill 在 skill_blacklist 中 → 跳过
+
+    Args:
+        base_intents: 基础意图配置列表（从 intent_config.yml 加载）
+        base_agents: 基础智能体配置列表（从 agent_config.yml 加载）
+        base_skills: 基础技能配置列表（从 skill_config.yml 加载）
+        external_intents: mng 返回的外部意图原始列表
+        permissions: 用户权限 {"agent_whitelist": [...], "skill_blacklist": [...]}
+        external_skills_dir: 外部技能根目录
+
+    Returns:
+        (merged_intents, merged_agents, merged_skills):
+        - merged_intents: 基础意图 + 过滤后的外部意图
+        - merged_agents: 基础智能体 + 过滤后的外部智能体
+        - merged_skills: 基础技能 + 过滤后的外部技能
+    """
+    agent_whitelist = _build_whitelist_codes(
+        permissions.get("agent_whitelist", []) if permissions else []
+    )
+    whitelist_mcp_map = _build_whitelist_mcp_map(
+        permissions.get("agent_whitelist", []) if permissions else []
+    )
+    skill_blacklist = build_blacklist_codes(
+        permissions.get("skill_blacklist", []) if permissions else []
+    )
+
+    merged_intents = list(base_intents) if base_intents else []
+    merged_agents = list(base_agents) if base_agents else []
+    merged_skills = list(base_skills) if base_skills else []
+
+    # 记录已经追加过的 agent/skill code，避免重复
+    known_agent_ids = {a.get("id") for a in merged_agents if isinstance(a, dict)}
+    known_skill_names = {s.get("name") for s in merged_skills if isinstance(s, dict)}
+
+    # external_skills_dir 未配置时，外部 skill 无法加载，跳过全部外部意图
+    skip_external_skills = not external_skills_dir
+
+    for ext in (external_intents or []):
+        if not isinstance(ext, dict):
+            continue
+
+        intent_name = ext.get("name", "")
+        intent_description = ext.get("definition", "")
+        intent_code = ext.get("intentCode", "")
+        if not intent_code:
+            logger.warning(
+                f"[mng_service] 外部意图缺少 intentCode: {intent_name}，跳过"
+            )
+            continue
+
+        # 解析该意图关联的 agent
+        agent_data = ext.get("agent", {})
+        if not isinstance(agent_data, dict) or not agent_data:
+            logger.warning(
+                f"[mng_service] 外部意图 {intent_code} 无关联 agent，跳过"
+            )
+            continue
+
+        agent_id = agent_data.get("id", "")
+        # 白名单检查
+        if agent_id not in agent_whitelist:
+            logger.info(
+                f"[mng_service] 外部 agent '{agent_id}' 不在白名单中，跳过"
+            )
+            continue
+        selected_agent = agent_data
+
+        if selected_agent is None:
+            logger.info(
+                f"[mng_service] 外部意图 {intent_code} 无可用 agent"
+                f"（白名单过滤后），跳过"
+            )
+            continue
+
+        agent_code = selected_agent.get("id", "")
+        agent_name = selected_agent.get("name", "")
+        agent_prompt = selected_agent.get("system_prompt", "") or ""
+
+        # 解析该意图关联的 skills
+        skills_data = ext.get("skills", [])
+        skill_codes = []  # 分配给该 agent 的 skill code 列表
+        for skill_item in (skills_data or []):
+            if not isinstance(skill_item, dict):
+                continue
+            skill_code = skill_item.get("code", "")
+            if not skill_code:
+                continue
+            # 黑名单检查
+            if skill_code in skill_blacklist:
+                logger.info(
+                    f"[mng_service] 外部 skill '{skill_code}' 在黑名单中，跳过"
+                )
+                continue
+
+            # external_skills_dir 未配置时跳过 skill 加载（agent 仍可无工具运行）
+            if skip_external_skills:
+                logger.warning(
+                    f"[mng_service] EXTERNAL_SKILLS_DIR 未配置，"
+                    f"跳过外部 skill '{skill_code}'"
+                )
+                continue
+
+            skill_codes.append(skill_code)
+
+            # 构建 skill_config 格式，追加到技能列表
+            skill_name = skill_code  # skill name 用 code
+            if skill_name not in known_skill_names:
+                known_skill_names.add(skill_name)
+                merged_skills.append({
+                    "name": skill_name,
+                    "directory": f"{external_skills_dir}/{skill_code}",
+                    "description": skill_item.get("name", skill_code),
+                })
+
+        # 构建 intent_config 格式（参考 intent_config.yml 中的 intent 条目）
+        merged_intents.append({
+            "id": intent_code,          # intent.id = intentCode
+            "name": intent_name,
+            "description": intent_description, # 外部意图没有独立 description，用 name
+            "agent": agent_code,        # intent.agent = agent.code
+            "level": ext.get("level"),
+            "parent_code": ext.get("parentCode"),
+        })
+
+        # 构建 agent_config 格式（参考 agent_config.yml 中的 agent 条目）
+        if agent_code not in known_agent_ids:
+            known_agent_ids.add(agent_code)
+            merged_agents.append({
+                "id": agent_code,
+                "name": agent_name,
+                "skills": skill_codes,
+                "system_prompt": agent_prompt,
+                # 白名单项携带 mcpClientConfig 时附加到该智能体（键转 snake_case）
+                **(
+                    {"mcp_client_config": whitelist_mcp_map[agent_id]}
+                    if agent_id in whitelist_mcp_map
+                    else {}
+                ),
+            })
+
+    logger.info(
+        f"[mng_service] 外部意图合并完成："
+        f"intents={len(merged_intents) - len(base_intents)}新增，"
+        f"agents={len(merged_agents) - len(base_agents)}新增，"
+        f"skills={len(merged_skills) - len(base_skills)}新增"
+    )
+
+    return merged_intents, merged_agents, merged_skills

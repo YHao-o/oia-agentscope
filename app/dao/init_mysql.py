@@ -1,0 +1,259 @@
+"""MySQL 建表初始化。"""
+import logging
+
+import aiomysql
+
+logger = logging.getLogger(__name__)
+
+INIT_SQL = """
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id   VARCHAR(64) PRIMARY KEY,
+    user_id      VARCHAR(64) NOT NULL,
+    name         VARCHAR(255) NOT NULL DEFAULT '',
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    message_count INT NOT NULL DEFAULT 0,
+    latest_trace_id VARCHAR(255),
+    is_pinned    TINYINT(1) NOT NULL DEFAULT 0,
+    pinned_at    TIMESTAMP NULL,
+    agent_ids    JSON NULL DEFAULT NULL,
+    -- 逻辑删除标记：NULL=活跃；非 NULL=已删除（删除时间）。子表数据保留
+    deleted_at   TIMESTAMP NULL DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_updated_at ON sessions(updated_at DESC);
+CREATE INDEX idx_sessions_user_pinned
+    ON sessions(user_id, pinned_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_states (
+    session_id   VARCHAR(64) NOT NULL,
+    agent_id     VARCHAR(64) NOT NULL,
+    state        JSON NOT NULL,
+    updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, agent_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS messages (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id   VARCHAR(64) NOT NULL,
+    role         VARCHAR(32) NOT NULL,
+    content      TEXT NOT NULL,
+    timestamp    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    agent_ids    JSON NULL DEFAULT NULL,
+    user_id      VARCHAR(64) NOT NULL DEFAULT '',
+    success      TINYINT(1) NOT NULL DEFAULT 1,
+    tokens       INT NOT NULL DEFAULT 0,
+    message_pair_id VARCHAR(64) NULL DEFAULT NULL,
+    citations       JSON NULL,
+    bocha_sum       JSON NULL,
+    content_parts   JSON NULL,
+    -- 点赞点踩：1=赞 0=踩 NULL=未反馈（仅 assistant 行；按 message_pair_id 定位本轮回复）
+    feedback       TINYINT(1) NULL DEFAULT NULL,
+    -- 反馈评价内容（点踩后用户填写的文字说明，随 feedback 一同覆盖更新）
+    feedback_comment VARCHAR(1024) NULL DEFAULT NULL,
+    -- 逻辑删除标记：NULL=活跃；非 NULL=已删除（删除时间）。物理行保留
+    deleted_at      TIMESTAMP NULL DEFAULT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_messages_session_id ON messages(session_id);
+CREATE INDEX idx_messages_timestamp ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS session_files (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id   VARCHAR(64) NOT NULL,
+    name         VARCHAR(255) NOT NULL,
+    path         VARCHAR(512) NOT NULL,
+    url          VARCHAR(512) NOT NULL,
+    size         BIGINT NOT NULL DEFAULT 0,
+    media_type   VARCHAR(255) NOT NULL DEFAULT 'application/octet-stream',
+    message_id     BIGINT       NULL,
+    message_pair_id VARCHAR(64) NULL,
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE UNIQUE INDEX uniq_session_file ON session_files(session_id, path);
+CREATE INDEX idx_session_files_session_id ON session_files(session_id);
+
+-- 上传文件即解析：记录上传文件名、解析内容、所属会话与消息
+-- message_id 上传时对话未开始为 NULL，问答结束回填（session 行此时可能尚不存在，故不加外键）
+CREATE TABLE IF NOT EXISTS upload_files (
+    id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id     VARCHAR(64) NOT NULL,
+    user_id        VARCHAR(64) NOT NULL DEFAULT '',
+    filename       VARCHAR(255) NOT NULL,
+    media_type     VARCHAR(255) NOT NULL DEFAULT '',
+    parse_type     VARCHAR(16) NOT NULL DEFAULT '',
+    file_size      BIGINT NOT NULL DEFAULT 0,
+    status         VARCHAR(16) NOT NULL DEFAULT 'pending',
+    parsed_content MEDIUMTEXT NULL,
+    error_message  VARCHAR(1024) NULL,
+    message_id     BIGINT NULL,
+    message_pair_id VARCHAR(64) NULL,
+    created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_upload_files_session_msg ON upload_files(session_id, message_id);
+CREATE INDEX idx_upload_files_user_id ON upload_files(user_id);
+
+-- 消息分享记录：shared_id 为 16 位随机十六进制串；不设 FK（分享记录独立于会话生命周期）
+-- title：分享标题（创建时取被分享首条用户消息截断 50 字符）
+CREATE TABLE IF NOT EXISTS message_shares (
+    id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    shared_id        VARCHAR(32) NOT NULL,
+    session_id       VARCHAR(64) NOT NULL,
+    user_id          VARCHAR(64) NOT NULL DEFAULT '',
+    message_pair_ids JSON NOT NULL,
+    title            VARCHAR(255) NOT NULL DEFAULT '',
+    created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE UNIQUE INDEX uniq_message_shares_shared_id ON message_shares(shared_id);
+CREATE INDEX idx_message_shares_session_id ON message_shares(session_id);
+
+-- 收藏消息：表结构与 messages 相同，仅新增 favorite_id 与 title（一批收藏共享两者）
+-- title：收藏标题（创建时取组内首条用户消息截断 50 字符，组内各行冗余同值）
+-- 不设 FK 到 sessions（收藏是消息副本，会话删除后保留）；自增 id 即收藏时间顺序
+CREATE TABLE IF NOT EXISTS message_favorites (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    favorite_id     VARCHAR(32) NOT NULL,
+    title           VARCHAR(255) NOT NULL DEFAULT '',
+    session_id      VARCHAR(64) NOT NULL,
+    role            VARCHAR(32) NOT NULL,
+    content         TEXT NOT NULL,
+    timestamp       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    agent_ids       JSON NULL DEFAULT NULL,
+    user_id         VARCHAR(64) NOT NULL DEFAULT '',
+    success         TINYINT(1) NOT NULL DEFAULT 1,
+    tokens          INT NOT NULL DEFAULT 0,
+    message_pair_id VARCHAR(64) NULL DEFAULT NULL,
+    citations       JSON NULL,
+    bocha_sum       JSON NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_message_favorites_user_fid ON message_favorites(user_id, favorite_id);
+
+CREATE TABLE IF NOT EXISTS action_audit (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    userId     VARCHAR(64) NOT NULL,
+    action     VARCHAR(128) NOT NULL,
+    query      VARCHAR(1024) NOT NULL DEFAULT '',
+    confirm    TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_action_audit_userId ON action_audit(userId);
+
+-- 制度问答知识缺口表：记录空应答问题（kb_id+question_hash 去重，open/resolved 生命周期）
+CREATE TABLE IF NOT EXISTS knowledge_gaps (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    gap_id        VARCHAR(64) NOT NULL,
+    kb_id         VARCHAR(128) NOT NULL,
+    question      TEXT NOT NULL,
+    question_hash VARCHAR(64) NOT NULL,
+    question_type VARCHAR(64) NULL,
+    status        ENUM('open','resolved') NOT NULL DEFAULT 'open',
+    empty_count   INTEGER NOT NULL DEFAULT 1,
+    first_seen_at DATETIME NULL,
+    last_seen_at  DATETIME NULL,
+    resolved_at   DATETIME NULL,
+    resolved_by   VARCHAR(128) NULL,
+    created_at    DATETIME NULL,
+    updated_at    DATETIME NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE UNIQUE INDEX uq_gaps_gap_id ON knowledge_gaps(gap_id);
+CREATE INDEX idx_gaps_kb_id ON knowledge_gaps(kb_id);
+CREATE INDEX idx_gaps_question_hash ON knowledge_gaps(question_hash);
+CREATE INDEX idx_gaps_status ON knowledge_gaps(status);
+
+-- 兼容已存在表：追加 agent_ids 列（MySQL 8 支持 IF NOT EXISTS）
+ALTER TABLE sessions ADD COLUMN (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE messages ADD COLUMN (success TINYINT(1) NOT NULL DEFAULT 1);
+ALTER TABLE messages ADD COLUMN (tokens INT NOT NULL DEFAULT 0);
+ALTER TABLE upload_files ADD COLUMN (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE upload_files ADD COLUMN (file_size BIGINT NOT NULL DEFAULT 0);
+ALTER TABLE messages ADD COLUMN (message_pair_id VARCHAR(64) NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (citations JSON NULL);
+ALTER TABLE messages ADD COLUMN (bocha_sum JSON NULL);
+-- 有序内容片段（text / custom_component / feedback_component），前端刷新后按序渲染
+ALTER TABLE messages ADD COLUMN (content_parts JSON NULL);
+ALTER TABLE messages ADD COLUMN (feedback TINYINT(1) NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (feedback_comment VARCHAR(1024) NULL DEFAULT NULL);
+ALTER TABLE session_files ADD COLUMN (message_id BIGINT NULL);
+ALTER TABLE session_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE upload_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE message_shares ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
+ALTER TABLE message_favorites ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
+-- 逻辑删除标记（存量表升级；重复列报 1060 被下方兼容逻辑忽略）
+ALTER TABLE sessions ADD COLUMN (deleted_at TIMESTAMP NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (deleted_at TIMESTAMP NULL DEFAULT NULL);
+
+-- 存量回填：按所属会话反查上传者（幂等；会话已删除的孤儿记录保持空串，不误归属）
+UPDATE upload_files uf
+JOIN sessions s ON uf.session_id = s.session_id
+SET uf.user_id = s.user_id
+WHERE uf.user_id = '';
+"""
+
+
+async def init_mysql_tables(pool: aiomysql.Pool) -> None:
+    """在 MySQL 中创建所需的表（幂等，CREATE TABLE IF NOT EXISTS）。
+
+    注意：索引的 CREATE INDEX 语句不包含 IF NOT EXISTS，
+    如果索引已存在会抛出警告（不影响运行），通过 try/except 兼容。
+    """
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                # 逐条执行，已存在的表/索引会跳过或报 warning
+                for statement in _split_statements(INIT_SQL):
+                    stmt = statement.strip()
+                    if stmt:
+                        try:
+                            await cur.execute(stmt)
+                        except Exception as exec_err:
+                            # 索引已存在时忽略（MySQL 不直接支持
+                            # CREATE INDEX IF NOT EXISTS）
+                            code = getattr(exec_err, "args", [None])[0]
+                            if isinstance(code, int) and code in (1060, 1061, 1064):
+                                # 1060: 重复列；1061: 重复索引；
+                                # 1064: 语法错误（MySQL 5.7 不支持
+                                # ADD COLUMN IF NOT EXISTS）
+                                logger.debug(
+                                    f"Ignoring SQL error {code}, skipping: "
+                                    f"{stmt[:60]}..."
+                                )
+                            else:
+                                raise
+        logger.info("MySQL tables initialized successfully")
+    except Exception:
+        logger.exception("Failed to initialize MySQL tables")
+        raise
+
+
+def _split_statements(sql: str) -> list:
+    """将多语句 SQL 字符串按分号拆分为独立语句。"""
+    statements = []
+    current = []
+    for line in sql.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("--") or stripped.startswith("#"):
+            continue
+        current.append(line)
+        if stripped.endswith(";"):
+            statements.append("\n".join(current))
+            current = []
+    if current:
+        remaining = "\n".join(current).strip()
+        if remaining:
+            statements.append(remaining)
+    return statements
+
