@@ -137,10 +137,8 @@ api:
     level: "INFO"
     # LOG_DIR，需落在 api.persistence.logs.mountPath 下才会持久化
     dir: "/app/logs"
-    # LOG_MAX_BYTES（单文件滚动大小，64MiB）。用字符串避免 Helm 渲染成科学计数法
-    maxBytes: "67108864"
-    # LOG_BACKUP_COUNT
-    backupCount: 7
+    # LOG_BACKUP_DAYS：按天轮转的日志保留天数
+    backupDays: 60
 
   # ---- 管理中心（用户鉴权 / 意图卡片地址分离） ----
   mng:

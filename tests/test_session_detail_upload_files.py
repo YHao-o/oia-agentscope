@@ -2,7 +2,7 @@
 
 覆盖：
 - upload_files 字段结构（name/size/media_type/created_at/message_id/
-  message_pair_id）与未消费记录的 null 语义
+  message_pair_id）；仅含已绑定 message_pair_id 的记录
 - messages / files 新字段（message_pair_id / citations / message_id）透出
 - upload_file_dao=None 时 upload_files 为 []
 - list_files_by_session 抛异常时降级为 [] 且不向外抛出
@@ -40,14 +40,14 @@ def _make_dao():
     return dao
 
 
-# 两条上传记录：一条已绑定（被某轮问答消费），一条未消费（null 语义）
+# 两条上传记录：均已被某轮问答消费（DAO 已过滤未绑定/已删会话/已删对话的记录）
 _UPLOAD_ROWS = [
     {"name": "报告.pdf", "size": 2048, "media_type": "application/pdf",
      "created_at": "2026-01-01 00:00:00.500",
      "message_id": 101, "message_pair_id": "pair-1"},
     {"name": "语音.m4a", "size": 1024, "media_type": "audio/mp4",
      "created_at": "2026-01-01 00:00:01.500",
-     "message_id": None, "message_pair_id": None},
+     "message_id": 103, "message_pair_id": "pair-2"},
 ]
 
 
@@ -63,7 +63,7 @@ def _make_upload_dao(rows=None, exc=None):
 
 @pytest.mark.asyncio
 async def test_get_session_detail_returns_upload_files():
-    """upload_files 列出该会话全部上传文件，未消费记录 message_id/pair_id 为 null。"""
+    """upload_files 仅列出已被对话消费（绑定 message_pair_id）的上传文件。"""
     dao = _make_dao()
     upload_dao = _make_upload_dao()
     svc = SessionService(dao, upload_file_dao=upload_dao)
@@ -82,9 +82,8 @@ async def test_get_session_detail_returns_upload_files():
     # 已消费记录绑定本轮 user 消息 id 与配对 id
     assert uploads[0]["message_id"] == 101
     assert uploads[0]["message_pair_id"] == "pair-1"
-    # 未消费记录两者为 null
-    assert uploads[1]["message_id"] is None
-    assert uploads[1]["message_pair_id"] is None
+    assert uploads[1]["message_id"] == 103
+    assert uploads[1]["message_pair_id"] == "pair-2"
     assert uploads[1]["name"] == "语音.m4a"
 
 

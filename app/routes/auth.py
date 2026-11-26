@@ -135,11 +135,11 @@ def _merge_regulations_agents(agent_whitelist: list) -> list:
 def _normalize_agent_access(agent_access: list) -> list:
     """返回前端前的 agent_access 统一格式。
 
-    去掉 show 字段与 mcpClientConfig 字段（后者含 authorization 鉴权凭证，
-    不下发前端），description 兜底空串。
+    去掉 mcpClientConfig 字段（含 authorization 鉴权凭证，不下发前端）；
+    保留 show 字段（前端据此决定是否渲染该智能体入口），description 兜底空串。
 
     仅作用于响应构造层；Redis permissions 保持原始结构
-    （含 show/mcpClientConfig，供权限融合/MCP 注册使用）。非 dict 项原样保留。
+    （含 mcpClientConfig，供权限融合/MCP 注册使用）。非 dict 项原样保留。
     """
     if not isinstance(agent_access, list):
         return agent_access
@@ -151,7 +151,7 @@ def _normalize_agent_access(agent_access: list) -> list:
         cleaned = {
             k: v
             for k, v in item.items()
-            if k not in ("show", "mcpClientConfig")
+            if k not in ("mcpClientConfig",)
         }
         cleaned["description"] = item.get("description") or ""
         normalized.append(cleaned)

@@ -12,8 +12,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from agentscope.state import AgentState
 from agentscope.permission import PermissionContext, PermissionMode
+from agentscope.message import TextBlock, UserMsg
 
 from app.services.agent_state_store import (
+    inject_session_context,
     load_agent_state,
     migrate_legacy_enum_values,
 )
@@ -178,9 +180,12 @@ async def test_load_inherits_context_from_latest_agent_when_no_own_state():
     """目标 agent 无历史状态时，继承同会话最近 agent 的对话上下文。"""
     latest_state = {
         "session_id": "s1",
+        # context 为 Msg 序列化格式（name + content 块列表），与落库结构一致
         "context": [
-            {"role": "user", "content": "你好"},
-            {"role": "assistant", "content": "你好！有什么可以帮你的？"},
+            {"name": "user", "role": "user",
+             "content": [{"type": "text", "text": "你好"}]},
+            {"name": "assistant", "role": "assistant",
+             "content": [{"type": "text", "text": "你好！有什么可以帮你的？"}]},
         ],
         "summary": "用户打招呼",
         "permission_context": {"mode": "bypass"},
@@ -212,6 +217,65 @@ async def test_load_returns_none_when_latest_state_not_dict():
 
     result = await load_agent_state(session_service, "s1", "regulations_agent")
     assert result is None
+
+
+# ================================================================
+# inject_session_context：会话级历史注入（跨智能体共用整场对话记忆）
+# ================================================================
+
+def test_inject_creates_state_with_session_history_when_none():
+    """agent 本会话从未执行过（state=None）时，用会话历史新建状态。"""
+    history = [
+        {"role": "user", "content": "我问过的问题"},
+        {"role": "assistant", "content": "我的回答"},
+    ]
+
+    state = inject_session_context(None, "s1", history)
+
+    assert state is not None
+    assert state.permission_context.mode == PermissionMode.BYPASS
+    assert [m.role for m in state.context] == ["user", "assistant"]
+    assert state.context[0].content[0].text == "我问过的问题"
+
+
+def test_inject_overrides_existing_agent_context():
+    """已有状态的 agent：context 被会话历史覆盖，summary 保留。"""
+    existing = AgentState(
+        session_id="s1",
+        summary="旧摘要",
+        permission_context=PermissionContext(mode=PermissionMode.BYPASS),
+    )
+    existing.context = [UserMsg(name="user", content=[TextBlock(text="旧记忆")])]
+
+    state = inject_session_context(existing, "s1", [
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "第一答"},
+    ])
+
+    assert state is existing
+    assert state.summary == "旧摘要"
+    assert [m.content[0].text for m in state.context] == ["第一问", "第一答"]
+
+
+def test_inject_noop_when_history_empty():
+    """history 为空时原样返回（None 仍为 None）。"""
+    assert inject_session_context(None, "s1", []) is None
+    assert inject_session_context(None, "s1", None) is None
+
+
+def test_inject_skips_invalid_history_entries():
+    """非 user/assistant、空内容、非 dict 的条目一律跳过。"""
+    history = [
+        {"role": "system", "content": "忽略我"},
+        {"role": "user", "content": ""},
+        "not-a-dict",
+        {"role": "user", "content": "有效问题"},
+    ]
+
+    state = inject_session_context(None, "s1", history)
+
+    assert len(state.context) == 1
+    assert state.context[0].content[0].text == "有效问题"
 
 
 # ================================================================

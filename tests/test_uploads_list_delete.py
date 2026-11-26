@@ -88,6 +88,11 @@ async def test_dao_list_files_by_user_returns_upload_file_id():
     sql, args = cur.executed[0]
     assert "SELECT id, session_id, message_id, filename, media_type, file_size" in sql
     assert "ORDER BY id DESC" in sql
+    # 屏蔽未绑定 / 已删会话 / 已删对话
+    assert "message_pair_id IS NOT NULL" in sql
+    assert "EXISTS (SELECT 1 FROM messages m" in sql
+    assert "m.deleted_at IS NULL" in sql
+    assert "s.deleted_at IS NULL" in sql
     assert args == ("u1",)
 
 

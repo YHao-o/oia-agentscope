@@ -9,6 +9,7 @@ import json
 import logging
 import logging.handlers
 import os
+import socket
 import sys
 from datetime import datetime, timezone
 
@@ -79,10 +80,15 @@ def setup_logging() -> None:
     log_dir = os.getenv("LOG_DIR", "logs")
     try:
         os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
-            os.path.join(log_dir, "observability.json"),
-            maxBytes=int(os.getenv("LOG_MAX_BYTES", str(64 * 1024 * 1024))),
-            backupCount=int(os.getenv("LOG_BACKUP_COUNT", "7")),
+        # 多副本共享 RWX 日志卷：按主机名（k8s 下即 Pod 名）分文件，避免多进程
+        # 同时轮转同一文件互踩导致丢日志。按天（本地午夜）轮转，跨天重命名为
+        # observability-<host>.json.YYYY-MM-DD，LOG_BACKUP_DAYS 控制保留天数。
+        host = socket.gethostname() or "unknown"
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            os.path.join(log_dir, f"observability-{host}.json"),
+            when="midnight",
+            interval=1,
+            backupCount=int(os.getenv("LOG_BACKUP_DAYS", "60")),
             encoding="utf-8",
         )
         file_handler.setFormatter(TraceJsonFormatter())

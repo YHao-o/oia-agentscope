@@ -20,6 +20,10 @@ models:
     model_name: 'deepseek-v4-flash'
     base_url: 'https://geekai.co/api/v1'
     api_key: ''
+    # 客户端行为：意图识别/改写/编排为关键路径上的非流式调用，
+    # 超时收口避免个别慢请求拖死首屏；不重试避免放大延迟
+    timeout_seconds: 10
+    max_retries: 0
     parameters:
       temperature: 0.1
       max_tokens: 4096

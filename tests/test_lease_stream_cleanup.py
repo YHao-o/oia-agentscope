@@ -134,6 +134,7 @@ def streams(mode, behavior, spans, intent_count=1):
         _is_context_length_error=lambda exc: False,
         _safe_update_span=lambda *args: None,
         load_agent_state=AsyncMock(return_value=None),
+        inject_session_context=lambda state, *args, **kwargs: state,
     )
     methods("app/utils/agent_event_stream.py", ["iter_agent_events"], env)
     capture = methods("app/services/orchestrator_service.py",

@@ -117,10 +117,12 @@ async def list_user_uploads(
     request: Request,
     user: dict = Depends(current_user),
 ):
-    """按 user_id 查询该用户上传过的全部文件（最新在前）。
+    """按 user_id 查询该用户上传过且已被对话消费的文件（最新在前）。
 
+    仅返回绑定到某轮问答的文件：只上传未提问的记录、已删除会话及
+    已删除对话轮次所带的文件均被屏蔽。
     每条记录返回 upload_file_id / session_id / message_id / filename /
-    media_type / file_size；message_id 为 null 表示该文件尚未被对话消费。
+    media_type / file_size。
     """
     dao = getattr(request.app.state, "upload_file_dao", None)
     user_id = user.get("user_id")

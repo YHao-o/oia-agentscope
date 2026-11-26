@@ -293,6 +293,21 @@ async def _load_history_messages(session_service: Any, session_id: Optional[str]
         return []
 
 
+def _contains_data_blocks(messages: List[Dict[str, Any]]) -> bool:
+    """messages 中是否存在 type="data" 的内容块（文件/图片等附件）。
+
+    仅用于判定能否走"新建无附件会话"的空历史/空快照快路径：命中任一
+    data 块即视为带附件，保留既有加载逻辑（文件解析内容依赖会话上下文）。
+    """
+    for msg in messages or []:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "data":
+                    return True
+    return False
+
+
 async def _emit_recommended_questions(
     orchestrator_service,
     messages: List[Dict[str, Any]],
@@ -342,6 +357,7 @@ async def _persist_conversation_history(
     bocha_sum: Optional[List[dict]] = None,
     content_parts: Optional[List[dict]] = None,
     round_state: Optional[RoundState] = None,
+    round_start: Optional[str] = None,
 ) -> Optional[dict]:
     """持久化本轮对话历史（用户输入 + 智能体输出）。
 
@@ -355,6 +371,10 @@ async def _persist_conversation_history(
     （均随 assistant 消息落库，空则不写）。
     落库成功后把本轮 user 消息 id 回填到本轮消费的上传文件
     （upload_files.message_id），避免下一轮重复注入解析内容。
+    round_start 为本轮提问时刻（请求到达时的北京时间字面值，与 now_str 同格式），
+    写入 user 行 timestamp；assistant 行仍取落库时刻 now_str（回答结束）。
+    两行因此不再同值：user 行=提问时间，assistant 行=回答结束时间；
+    未传 round_start 时 user 行回退 now_str（兼容调用方/测试）。
 
     Returns:
         {"user_message_id": int|None, "assistant_message_id": int|None}，失败为 None。
@@ -414,7 +434,8 @@ async def _persist_conversation_history(
         new_messages = []
         if user_input or file_only_round:
             new_messages.append({
-                "role": "user", "content": user_input, "timestamp": now_str,
+                "role": "user", "content": user_input,
+                "timestamp": round_start or now_str,
                 "agent_ids": [],
                 "user_id": user_id,
                 "success": True,
@@ -797,7 +818,7 @@ def create_model_from_config(model_config: dict, message_pair_id: str = ""):
             context_size=context_size,
             # vLLM 部署的 Qwen3 等模型默认开启 thinking，显式关闭，
             # 通过 extra_body 透传 chat_template_kwargs 到请求体
-            extra_body={"chat_template_kwargs": {"enable_thinking": True,"reasoning_effort":"low"}},
+            extra_body={"chat_template_kwargs": {"enable_thinking": True,"reasoning_effort":"medium"}},
             **({"client_kwargs": client_kwargs} if client_kwargs else {}),
         )
     else:
@@ -881,6 +902,7 @@ async def generate_response(
     cancel_event: Optional[asyncio.Event] = None,
     workspace_manager: Any = None,
     run_id: Optional[str] = None,
+    is_new_session: bool = False,
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
@@ -932,8 +954,20 @@ async def generate_response(
             return False
 
     # ① 加载历史（限 3 轮）并合并当前输入
-    history_messages = await _load_history_messages(session_service, session_id)
-    full_messages = history_messages + messages
+    # 新建且无 data 附件的会话：历史必为空、快照必为空，跳过两次
+    # 查询/扫描（由路由透传 is_new_session 标记，见 routes/chat.py）。
+    # 带 data 块时保留既有逻辑——上传文件解析内容依赖会话上下文。
+    skip_empty_preflight = is_new_session and not _contains_data_blocks(messages)
+    if skip_empty_preflight:
+        history_messages = []
+        full_messages = messages
+        logger.info(
+            "[chat_service] 新会话无附件，跳过空历史与空快照 session=%s",
+            session_id,
+        )
+    else:
+        history_messages = await _load_history_messages(session_service, session_id)
+        full_messages = history_messages + messages
 
     # 诊断日志：确认前端传入的 agent_id 与历史消息中记录的 agent_ids
     last_assistant_agent_ids = None
@@ -1011,6 +1045,9 @@ async def generate_response(
     # 用于区分“用户主动停止”与系统原因导致的中断，避免文案与日志误判
     abort_reason: Optional[str] = None
     t0 = time.perf_counter()
+    # 本轮提问时刻（请求到达时的北京时间字面值）：写入 user 行 timestamp，
+    # 与 assistant 行的落库时刻（回答结束）区分开；格式与落库 now_str 一致
+    round_start_str = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     ttft_ms = None
     aborted_at_ms = None
 
@@ -1042,6 +1079,7 @@ async def generate_response(
             bocha_sum=collected_bocha_sum,
             content_parts=collected_content_parts,
             round_state=round_state,
+            round_start=round_start_str,
         )
 
     async def archive_files(persist_ids, completed_files=None):
@@ -1057,7 +1095,9 @@ async def generate_response(
 
     # 输入围栏 403 预检任务（③.6 创建，与意图链路并行；None = 尚未创建）
     probe_task: Optional[asyncio.Task] = None
-    if session_id:
+    # 新会话无附件时跳过空快照：before_files 保持 {}，轮末文件检测仍以
+    # 空快照为 before，正常识别本轮新产物
+    if session_id and not skip_empty_preflight:
         try:
             if workspace_manager is not None:
                 before_files = await workspace_manager.list_session_files(user_id, session_id)
@@ -1139,6 +1179,7 @@ async def generate_response(
                     ) if request is not None else None,
                     message_pair_id=message_pair_id,
                     round_state=round_state,
+                    round_start=round_start_str,
                 )
                 return
 
@@ -1208,6 +1249,7 @@ async def generate_response(
                         ) if request is not None else None,
                         message_pair_id=message_pair_id,
                         round_state=round_state,
+                        round_start=round_start_str,
                     )
                     return
                 if event_type == "error":

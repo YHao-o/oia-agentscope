@@ -40,7 +40,7 @@ from app.services.chat_service import (
     FILE_ONLY_DEFAULT_QUESTION,
     create_model_from_config,
 )
-from app.services.agent_state_store import load_agent_state
+from app.services.agent_state_store import inject_session_context, load_agent_state
 from app.services.upload_context_provider import (
     append_upload_context,
     build_recognizer_file_hint,
@@ -159,7 +159,11 @@ class OrchestratorService:
         intent_model_cfg = model_config.get("models", {}).get(
             "intent_recognizer", default_model_cfg
         )
-        intent_client = create_async_client(intent_model_cfg)
+        intent_client = create_async_client(
+            intent_model_cfg,
+            timeout=intent_model_cfg.get("timeout_seconds", 10),
+            max_retries=intent_model_cfg.get("max_retries", 0),
+        )
         # 并行编排结果汇总用客户端（默认业务大模型）
         summary_client = create_async_client(default_model_cfg)
         # 输入围栏 403 预检专用客户端（models.input_guard 配置段）：
@@ -477,6 +481,7 @@ class OrchestratorService:
         session_service: Any,
         langfuse_service: Any,
         round_state: RoundState,
+        history: Optional[List[dict]] = None,
     ) -> AsyncGenerator[str, None]:
         """单 agent 直接问答全流程：校验 → 加载状态 → 创建 → span 内流式执行 → 存状态 → 记标志 → yield summary。
 
@@ -500,8 +505,13 @@ class OrchestratorService:
 
         intent = Intent(id=f"direct_{agent_id}", query=user_input, agent=agent_id)
 
-        # 加载已有 AgentState
-        agent_state = await load_agent_state(session_service, session_id, agent_id)
+        # 加载已有 AgentState，并注入会话级历史：显式选择的智能体也应看到
+        # 整场对话，而不是只看到自己那份（切换智能体后易过期/被截断的）记忆
+        agent_state = inject_session_context(
+            await load_agent_state(session_service, session_id, agent_id),
+            session_id,
+            history,
+        )
 
         # 创建 agent 实例
         agent = agent_factory.create_for_agent(
@@ -866,7 +876,7 @@ class OrchestratorService:
                     self._run_single_agent_path(
                         registry, agent_factory, agent_id, user_input,
                         session_id, user_id, session_service, langfuse_service,
-                        round_state,
+                        round_state, history=history,
                     ),
                     round_state,
                 )) as stream:
@@ -936,6 +946,9 @@ class OrchestratorService:
         })
 
         # ⑤ 意图编排（第二次 LLM，失败降级为 independent）
+        # 单意图短路：len(intents)==1 时编排关系无决策空间（relation 恒为
+        # independent，get_orchestration_mode 仍按 single_intent 配置选择
+        # pipeline），直接使用等价默认值，省一次 LLM 往返改善 TTFT。
         yield self._event({
             "type": "intent_step", "phase": "orchestration", "status": "started",
             "message": "正在决策编排策略...",
@@ -944,13 +957,21 @@ class OrchestratorService:
             langfuse_service, "intent-orchestration",
             {"intents_count": len(intents)},
         ) as orch_span:
-            try:
-                relation, execution_order, orch_prompts = await recognizer.plan_orchestration(rewritten, intents)
-                _orch_extra = {}
-            except Exception as e:
-                logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
+            if len(intents) == 1:
                 relation, execution_order, orch_prompts = "independent", [], {}
-                _orch_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+                _orch_extra = {"skipped": "single_intent"}
+                logger.info(
+                    "[OrchestratorService] 单意图跳过编排决策 session=%s",
+                    session_id,
+                )
+            else:
+                try:
+                    relation, execution_order, orch_prompts = await recognizer.plan_orchestration(rewritten, intents)
+                    _orch_extra = {}
+                except Exception as e:
+                    logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
+                    relation, execution_order, orch_prompts = "independent", [], {}
+                    _orch_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
             _safe_update_span(orch_span, {
                 "relation": relation, "execution_order": execution_order,
                 "prompts": orch_prompts, **_orch_extra,
@@ -1009,8 +1030,12 @@ class OrchestratorService:
         agent_states: Dict[str, AgentState] = {}
         for intent in intent_result.intents:
             aid = intent.agent or "general_agent"
-            agent_states[aid] = await load_agent_state(
-                session_service, session_id, aid,
+            # 注入会话级历史：跨智能体共用整场对话记忆（否则切换智能体、
+            # 或切回默认问答时，作答模型只能看到该 agent 自己的旧上下文）
+            agent_states[aid] = inject_session_context(
+                await load_agent_state(session_service, session_id, aid),
+                session_id,
+                history,
             )
 
         # ⑥ 执行编排（内部实时 yield SSE 事件）

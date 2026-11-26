@@ -13,9 +13,22 @@ import aiomysql
 logger = logging.getLogger(__name__)
 
 # 会话属主以已登记的 sessions 为准，隔离历史遗留的异属主附件。
+# 子查询在会话已逻辑删除时返回 NULL，使 `user_id = NULL` 不成立，
+# 因此该条件同时屏蔽"已删除会话"所带的文件。
 _OWNER_SCOPE = (
     "AND user_id = (SELECT s.user_id FROM sessions s "
     "WHERE s.session_id = upload_files.session_id AND s.deleted_at IS NULL) "
+)
+
+# 仅保留绑定到某轮问答（message_pair_id 非空）且该轮消息仍活跃的文件：
+# - message_pair_id IS NULL：只上传、未提问（未被对话消费），屏蔽
+# - EXISTS 命中的是已逻辑删除的对话轮次：该轮所带文件一并屏蔽
+_ACTIVE_PAIR_SCOPE = (
+    "AND message_pair_id IS NOT NULL "
+    "AND EXISTS (SELECT 1 FROM messages m "
+    "WHERE m.session_id = upload_files.session_id "
+    "AND m.message_pair_id = upload_files.message_pair_id "
+    "AND m.deleted_at IS NULL) "
 )
 
 
@@ -223,17 +236,20 @@ class UploadFileDAO:
                 return row is not None
 
     async def list_files_by_user(self, user_id: str) -> List[dict]:
-        """查询某用户上传过的全部文件（最新在前）。
+        """查询某用户上传过且已被对话消费的文件（最新在前）。
 
+        仅返回绑定到某轮问答（message_pair_id 非空）的文件：
+        只上传未提问的记录、已删除会话及已删除对话轮次所带的文件均被屏蔽。
         返回每条记录的 upload_file_id / session_id / message_id / filename /
-        media_type / file_size；message_id 未绑定（对话尚未消费）时为 None。
+        media_type / file_size。
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT id, session_id, message_id, filename, media_type, "
                     "file_size FROM upload_files "
-                    "WHERE user_id = %s ORDER BY id DESC",
+                    "WHERE user_id = %s " + _OWNER_SCOPE + _ACTIVE_PAIR_SCOPE +
+                    "ORDER BY id DESC",
                     (user_id,),
                 )
                 rows = await cur.fetchall()
@@ -279,18 +295,20 @@ class UploadFileDAO:
                 return deleted
 
     async def list_files_by_session(self, session_id: str) -> List[dict]:
-        """查询某会话的全部上传文件（按上传顺序，含未被对话消费的记录）。
+        """查询某会话中已被对话消费的上传文件（按上传顺序）。
 
+        仅返回绑定到某轮问答（message_pair_id 非空）的文件：只上传未提问
+        的记录、已删除会话及已删除对话轮次所带的文件均被屏蔽。
         返回键：name / size / media_type / created_at / message_id /
-        message_pair_id；message_id、message_pair_id 未绑定（对话尚未消费）
-        时为 None。
+        message_pair_id。
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT filename, media_type, file_size, created_at, "
                     "message_id, message_pair_id FROM upload_files "
-                    "WHERE session_id = %s " + _OWNER_SCOPE + "ORDER BY id ASC",
+                    "WHERE session_id = %s " + _OWNER_SCOPE + _ACTIVE_PAIR_SCOPE +
+                    "ORDER BY id ASC",
                     (session_id,),
                 )
                 rows = await cur.fetchall()

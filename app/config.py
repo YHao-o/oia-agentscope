@@ -98,8 +98,8 @@ LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
 # 日志配置
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
-LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(64 * 1024 * 1024)))
-LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "7"))
+# 按天轮转的日志保留天数
+LOG_BACKUP_DAYS = int(os.getenv("LOG_BACKUP_DAYS", "60"))
 
 # 管理中心 - 用户鉴权（登录/注册）地址
 MNG_AUTH_URL = os.getenv("MNG_AUTH_URL", "")

@@ -134,7 +134,7 @@ redis://{{ if .Values.externalRedis.password }}:{{ urlquery .Values.externalRedi
    MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE /
    UPLOAD_MAX_SIZE_MB / SESSION_FILES_PERSIST_DIR /
    LANGFUSE_SECRET_KEY / LANGFUSE_PUBLIC_KEY / LANGFUSE_BASE_URL /
-   LOG_LEVEL / LOG_DIR / LOG_MAX_BYTES / LOG_BACKUP_COUNT /
+   LOG_LEVEL / LOG_DIR / LOG_BACKUP_DAYS /
    MNG_AUTH_URL / MNG_INTENT_URL / EXTERNAL_SKILLS_DIR /
    OPENSANDBOX_* / WORKSPACE_TTL / REGULATIONS_* / POLICY_QA_KB_MAP /
    MINERU_* / SENSITIVE_* / BOCHA_*
@@ -174,8 +174,7 @@ LANGFUSE_BASE_URL: {{ .Values.langfuse.baseUrl | quote }}
 # ===== 日志 =====
 LOG_LEVEL: {{ .Values.api.log.level | quote }}
 LOG_DIR: {{ .Values.api.log.dir | quote }}
-LOG_MAX_BYTES: {{ .Values.api.log.maxBytes | quote }}
-LOG_BACKUP_COUNT: {{ .Values.api.log.backupCount | quote }}
+LOG_BACKUP_DAYS: {{ .Values.api.log.backupDays | quote }}
 
 # ===== 管理中心（用户鉴权 / 意图卡片地址分离） =====
 MNG_AUTH_URL: {{ .Values.api.mng.authUrl | quote }}

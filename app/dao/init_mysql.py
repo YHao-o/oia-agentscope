@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id   VARCHAR(64) NOT NULL,
     role         VARCHAR(32) NOT NULL,
     content      TEXT NOT NULL,
+    -- 消息时刻：user 行=提问时刻（请求到达），assistant 行=回答结束时刻（落库）
     timestamp    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     agent_ids    JSON NULL DEFAULT NULL,
     user_id      VARCHAR(64) NOT NULL DEFAULT '',

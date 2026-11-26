@@ -165,6 +165,9 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
             fire_notify_mng_active(jwt_token)
     session_service = request.app.state.session_service
     user_id = user.get("user_id")
+    # 原始请求是否为新会话（无 session_id）：必须在 get_or_create_session 之前
+    # 计算——后者会给新会话生成 UUID，之后无法再区分
+    is_new_session = not body.session_id or not body.session_id.strip()
     session_id = await session_service.get_or_create_session(body.session_id, user_id)
     tasks = request.app.state.chat_tasks
     if session_id in tasks:
@@ -226,6 +229,7 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
             knowledge_bases=body.knowledge_bases,
             cancel_event=run.cancel_event, run_id=run.run_id,
             workspace_manager=getattr(request.app.state, "workspace_manager", None),
+            is_new_session=is_new_session,
         )) as generation:
             async for ev in generation:
                 yield ev

@@ -169,8 +169,9 @@ class TestBuildAuthSuccess:
             _MERGED_REGULATIONS_AGENT["description"]
         )
         assert "123" not in by_id
-        # 返回前端不带 show 字段
-        assert all("show" not in a for a in agent_access)
+        # 返回前端保留 show（前端据此决定是否渲染入口）；合并项无 show
+        assert by_id["999"]["show"] == 0
+        assert "show" not in by_id["regulations_agent"]
 
         # 存 Redis 的是已 enrich 且未合并的 permissions
         saved = save_mock.await_args.args[2]
@@ -196,8 +197,9 @@ class TestBuildAuthSuccess:
             _MERGED_REGULATIONS_AGENT["description"]
         )
         assert by_id["999"]["description"] == ""
-        # 返回前端不带 show 字段
-        assert all("show" not in a for a in agent_access)
+        # 返回前端保留 show（前端据此决定是否渲染入口）；合并项无 show
+        assert by_id["999"]["show"] == 0
+        assert "show" not in by_id["regulations_agent"]
 
     @pytest.mark.asyncio
     async def test_degrade_when_fuse_fails(self):
@@ -269,7 +271,7 @@ class TestMergeRegulationsAgents:
 
 # ---------- _normalize_agent_access ----------
 class TestNormalizeAgentAccess:
-    def test_fill_empty_description_and_drop_show(self):
+    def test_fill_empty_description_and_keep_show(self):
         items = [
             {"id": "111", "name": "通用问答", "show": 1},
             {"id": "999", "name": "生成PPT智能体", "show": 0, "description": "用于生成精美ppt"},
@@ -277,20 +279,29 @@ class TestNormalizeAgentAccess:
         ]
         normalized = _normalize_agent_access(items)
         assert normalized == [
-            {"id": "111", "name": "通用问答", "description": ""},
-            {"id": "999", "name": "生成PPT智能体", "description": "用于生成精美ppt"},
+            {"id": "111", "name": "通用问答", "show": 1, "description": ""},
+            {"id": "999", "name": "生成PPT智能体", "show": 0, "description": "用于生成精美ppt"},
             {"id": "222", "name": "无show无描述", "description": ""},
+        ]
+
+    def test_drop_mcp_client_config(self):
+        items = [{
+            "id": "999", "name": "生成PPT智能体", "show": 0,
+            "mcpClientConfig": {"authorization": "Bearer secret"},
+        }]
+        assert _normalize_agent_access(items) == [
+            {"id": "999", "name": "生成PPT智能体", "show": 0, "description": ""}
         ]
 
     def test_none_description_filled_with_empty_string(self):
         assert _normalize_agent_access(
             [{"id": "1", "name": "a", "show": 1, "description": None}]
-        ) == [{"id": "1", "name": "a", "description": ""}]
+        ) == [{"id": "1", "name": "a", "show": 1, "description": ""}]
 
     def test_keeps_other_fields(self):
         item = {"id": "1", "name": "a", "show": 1, "extra": "keep-me"}
         assert _normalize_agent_access([item]) == [
-            {"id": "1", "name": "a", "extra": "keep-me", "description": ""}
+            {"id": "1", "name": "a", "show": 1, "extra": "keep-me", "description": ""}
         ]
 
     def test_non_dict_items_kept_as_is(self):

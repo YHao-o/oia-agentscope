@@ -90,6 +90,45 @@ async def test_orchestrator_only_stages_child_states():
     service.save_agent_state.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_orchestration_path_injects_session_history_into_agent_state():
+    """编排路径：每个待执行 agent 都被注入会话级历史（跨智能体共用整场对话）。"""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    captured: dict = {}
+
+    class _CapturingOrchestrator:
+        _last_results: list = []
+
+        async def run(self, intent_result, session_id=None, agent_states=None,
+                      langfuse_service=None):
+            captured["agent_states"] = agent_states
+            yield 'data: {"type": "done"}\n\n'
+
+    svc = _make_service([], ws_delay=0)
+    svc._create_orchestrator = lambda mode, factory: _CapturingOrchestrator()
+
+    messages = [
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "第一答"},
+        {"role": "user", "content": "回到默认问答再问一次"},
+    ]
+    service = SimpleNamespace(
+        load_agent_state=AsyncMock(return_value=None),
+        get_latest_agent_state=AsyncMock(return_value=None),
+    )
+
+    async for _ in svc.run(messages, session_service=service, session_id="s1",
+                           user_id="u1"):
+        pass
+
+    state = captured["agent_states"]["general_agent"]
+    assert state is not None
+    assert [m.role for m in state.context] == ["user", "assistant"]
+    assert state.context[0].content[0].text == "第一问"
+
+
 def _make_service(marks: list, ws_delay: float = 0.3, ws_error: Exception | None = None):
     """构造只保留 run() 编排逻辑的服务实例，三个装配方法全部打桩。"""
     svc = OrchestratorService.__new__(OrchestratorService)

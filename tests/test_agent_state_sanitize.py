@@ -59,7 +59,9 @@ async def test_parallel_agent_states_wait_for_output_decision(monkeypatch, decis
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-    if decision == "allow":
+    if decision in ("allow", "outage"):
+        # outage（敏感服务不可用、client-fallback）输出已放行，agent_state
+        # 需同步落库，否则模型下一轮 context 为空、多轮对话断裂。
         assert stored == states
         assert service.save_agent_state.await_count == 2
     else:

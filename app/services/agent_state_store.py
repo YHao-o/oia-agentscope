@@ -146,6 +146,75 @@ async def load_agent_state(
         return None
 
 
+def _history_to_msgs(history: Optional[list]) -> list:
+    """把会话级历史（[{"role","content"}]）转成 AgentState 可用的 Msg 列表。
+
+    只保留 role 为 user/assistant 且 content 非空的条目，其余（工具轨迹、
+    system、空内容）一律跳过——它们不属于"聊过什么"的会话记忆。
+    """
+    from agentscope.message import AssistantMsg, TextBlock, UserMsg
+
+    msgs: list = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant") or not content:
+            continue
+        blocks = [TextBlock(text=str(content))]
+        if role == "user":
+            msgs.append(UserMsg(name="user", content=blocks))
+        else:
+            msgs.append(AssistantMsg(name="assistant", content=blocks))
+    return msgs
+
+
+def inject_session_context(
+    agent_state: Optional[AgentState],
+    session_id: Optional[str],
+    history: Optional[list],
+) -> Optional[AgentState]:
+    """把会话级历史注入 agent 上下文，保证跨智能体共享整场对话记忆。
+
+    多轮记忆原本按 agent 隔离（agent_states 表以 (session_id, agent_id) 为
+    主键），导致用户在同一会话内切换智能体、或切回默认问答时，作答模型只能
+    看到该 agent 自己的（可能过期/被截断的）上下文。这里在每次执行前用会话级
+    历史覆盖 agent.context——这份历史与查询改写/意图识别用的是同一个窗口，
+    因此"聊过什么"成为会话级资产，不再随智能体切换而丢失。
+
+    - history 为空（或全为无效条目）时原样返回；
+    - agent_state 为 None（该 agent 在本会话从未执行过）时新建一个带会话
+      历史的 AgentState，权限沿用 bypass（与 registry 新建 agent 时一致）；
+    - 只替换 context，保留 summary 及其它 agent 特定字段。
+    """
+    try:
+        msgs = _history_to_msgs(history)
+    except Exception:
+        logger.warning(
+            "[agent_state_store] 会话历史转换失败，跳过注入 session=%s",
+            session_id, exc_info=True,
+        )
+        return agent_state
+    if not msgs:
+        return agent_state
+
+    is_new = agent_state is None
+    if is_new:
+        from agentscope.permission import PermissionContext, PermissionMode
+
+        agent_state = AgentState(
+            session_id=session_id or "",
+            permission_context=PermissionContext(mode=PermissionMode.BYPASS),
+        )
+    agent_state.context = msgs
+    logger.debug(
+        "[agent_state_store] 注入会话历史 session=%s 条数=%d 新建=%s",
+        session_id, len(msgs), is_new,
+    )
+    return agent_state
+
+
 async def persist_agent_state(
     session_service: Any,
     session_id: Optional[str],
